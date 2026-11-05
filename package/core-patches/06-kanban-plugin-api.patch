@@ -1,0 +1,186 @@
+diff --git a/plugins/kanban/dashboard/plugin_api.py b/plugins/kanban/dashboard/plugin_api.py
+index c38f8e399b..30fff7fcd2 100644
+--- a/plugins/kanban/dashboard/plugin_api.py
++++ b/plugins/kanban/dashboard/plugin_api.py
+@@ -24,12 +24,13 @@ from pathlib import Path
+ from typing import Any, Callable, Iterator, Optional
+ 
+ from fastapi import (
+-    APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
++    APIRouter, Body, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status)
+ from fastapi.responses import FileResponse
+ from pydantic import BaseModel, Field
+ 
+-from hermes_cli import kanban_db
+-from hermes_cli import kanban_workflow
++from hermes_cli import (
++    kanban_db, kanban_workflow, orchestrator, orchestrator_reads,
++    superagent_pause, superagent_subscriptions)
+ from hermes_cli.web_read_coalescing import coalesced_read
+ from hermes_cli import kanban_db_connect as kbc
+ from hermes_cli import kanban_db_notify as kbn
+@@ -37,6 +38,7 @@ from hermes_cli import kanban_db_dispatch as kbd
+ from hermes_cli import kanban_db_workspace as kbw
+ from hermes_cli import kanban_diagnostics as kd
+ from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
++from tools import orchestrator_tools
+ 
+ log = logging.getLogger(__name__)
+ 
+@@ -1694,6 +1696,156 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
+     return get_orchestration_settings()  # callers re-render from the resolved state
+ 
+ 
++# --- Superagent Attention Panel Endpoints (Phase 5.3) -----------------------
++
++def _require_superagent_enabled() -> None:
++    """Ensure superagent is enabled in config; raise HTTP 404 when disabled."""
++    cfg = _load_config_or_empty()
++    sa_cfg = (cfg.get("superagent") or {}) if isinstance(cfg, dict) else {}
++    if not bool(sa_cfg.get("enabled", False)):
++        raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail="superagent is disabled")
++
++
++@router.get("/attention/overview")
++def get_attention_overview(board: Optional[str] = _BOARD_Q):
++    """Aggregate attention panel overview: health, 24h flows, needs_person, and tickets by stage."""
++    _require_superagent_enabled()
++    with _board_conn(board) as (board, conn):
++        return orchestrator_reads.overview(conn)
++
++
++@router.get("/attention/threads")
++def get_attention_threads(board: Optional[str] = _BOARD_Q):
++    """List distinct thread keys with their latest trigger and decision summaries."""
++    _require_superagent_enabled()
++    with _board_conn(board) as (board, conn):
++        return orchestrator_reads.threads(conn)
++
++
++@router.get("/attention/thread/{thread_key}")
++def get_attention_thread(thread_key: str, board: Optional[str] = _BOARD_Q):
++    """Return chronological event timeline for a specific thread_key."""
++    _require_superagent_enabled()
++    with _board_conn(board) as (board, conn):
++        return orchestrator_reads.thread_timeline(conn, thread_key)
++
++
++@router.get("/attention/decisions")
++def get_attention_decisions(
++    outcome: Optional[str] = Query(None, description="Optional outcome filter (e.g. 'accept', 'reject', 'unavailable')"),
++    limit: int = Query(50, description="Max decisions to return"),
++    board: Optional[str] = _BOARD_Q,
++):
++    """Return recent orchestrator decisions, newest first, with optional outcome filter."""
++    _require_superagent_enabled()
++    with _board_conn(board) as (board, conn):
++        return orchestrator_reads.decisions(conn, outcome=outcome, limit=limit)
++
++
++@router.get("/attention/tickets")
++def get_attention_tickets(
++    stage: Optional[str] = Query(None, description="Optional stage filter (e.g. 'person/delivery', 'queued', 'person')"),
++    board: Optional[str] = _BOARD_Q,
++):
++    """Return tickets with their derived stages, newest first, with optional stage filter."""
++    _require_superagent_enabled()
++    with _board_conn(board) as (board, conn):
++        return orchestrator_reads.tickets(conn, stage=stage)
++
++
++@router.get("/attention/ticket/{ticket_id}")
++def get_attention_ticket(ticket_id: str, board: Optional[str] = _BOARD_Q):
++    """Return detailed ticket information, mandate, inputs, and outbox entries (404 if missing)."""
++    _require_superagent_enabled()
++    with _board_conn(board) as (board, conn):
++        detail = orchestrator_reads.ticket_detail(conn, ticket_id)
++        if detail is None:
++            raise HTTPException(status_code=http_status.HTTP_404_NOT_FOUND, detail=f"ticket {ticket_id!r} not found")
++        return detail
++
++
++@router.get("/attention/settings")
++def get_attention_settings(board: Optional[str] = _BOARD_Q):
++    """Return superagent configuration view (mode, enabled, paused, surfaces)."""
++    _require_superagent_enabled()
++    with _board_conn(board) as (board, conn):
++        return orchestrator_reads.settings_view(conn)
++
++
++# --- Superagent Attention Panel POST Actions (Phase 5.3 POST) ---------------
++def _handle_sa_post(fn: Callable, args: dict[str, Any], fail: str) -> dict[str, Any]:
++    res = json.loads(fn(args))
++    if not res.get("ok"):
++        err = res.get("error", fail)
++        raise HTTPException(status_code=404 if "not found" in err.lower() else 400, detail=err)
++    return res
++
++@router.post("/attention/ticket/{ticket_id}/stop")
++@router.post("/attention/ticket/stop")
++def stop_attention_ticket(ticket_id: Optional[str] = None, payload: Optional[dict[str, Any]] = Body(None), board: Optional[str] = _BOARD_Q):
++    _require_superagent_enabled()
++    tid = ticket_id or (payload or {}).get("ticket_id") or (payload or {}).get("task_id")
++    if not tid: raise HTTPException(status_code=400, detail="ticket_id is required")
++    with _board_conn(board) as (board, conn):
++        res = orchestrator.stop_ticket(conn, tid, reason=(payload or {}).get("reason"))
++        if isinstance(res, str): raise HTTPException(status_code=404, detail=res)
++        return res
++
++@router.post("/attention/ticket/{ticket_id}/retry")
++@router.post("/attention/ticket/retry")
++def retry_attention_ticket(ticket_id: Optional[str] = None, payload: Optional[dict[str, Any]] = Body(None), board: Optional[str] = _BOARD_Q):
++    _require_superagent_enabled()
++    tid = ticket_id or (payload or {}).get("ticket_id") or (payload or {}).get("task_id")
++    if not tid: raise HTTPException(status_code=400, detail="ticket_id is required")
++    return _handle_sa_post(orchestrator_tools._handle_ticket_retry, {"task_id": tid, "reason": (payload or {}).get("reason"), "board": board}, "ticket retry failed")
++
++@router.post("/attention/decision/{decision_id}/dismiss")
++@router.post("/attention/decision/dismiss")
++def dismiss_attention_decision(decision_id: Optional[int] = None, payload: Optional[dict[str, Any]] = Body(None), board: Optional[str] = _BOARD_Q):
++    _require_superagent_enabled()
++    did = decision_id if decision_id is not None else (payload or {}).get("decision_id") or (payload or {}).get("id")
++    if did is None: raise HTTPException(status_code=400, detail="decision_id is required")
++    return _handle_sa_post(orchestrator_tools._handle_eval_decide, {"decision_id": did, "decision": "dismiss", "board": board}, "decision dismiss failed")
++
++@router.post("/attention/trigger/{trigger_id}/reevaluate")
++@router.post("/attention/trigger/{trigger_id}/requeue")
++def reevaluate_attention_trigger(trigger_id: Optional[str] = None, payload: Optional[dict[str, Any]] = Body(None), board: Optional[str] = _BOARD_Q):
++    _require_superagent_enabled()
++    trg = trigger_id or (payload or {}).get("trigger_id") or (payload or {}).get("task_id")
++    if not trg: raise HTTPException(status_code=400, detail="trigger_id is required")
++    return _handle_sa_post(orchestrator_tools._handle_trigger_requeue, {"trigger_id": trg, "board": board}, "trigger reevaluate failed")
++
++@router.post("/attention/thread/{thread_key}/unsubscribe-all")
++@router.post("/attention/thread/{thread_key}/unsubscribe")
++def unsubscribe_attention_thread(thread_key: Optional[str] = None, payload: Optional[dict[str, Any]] = Body(None), board: Optional[str] = _BOARD_Q):
++    _require_superagent_enabled()
++    tk = thread_key or (payload or {}).get("thread_key") or (payload or {}).get("thread_id")
++    if not tk: raise HTTPException(status_code=400, detail="thread_key is required")
++    with _board_conn(board) as (board, conn):
++        return {"ok": True, "thread_key": tk, "dropped": superagent_subscriptions.drop_thread_subscriptions(conn, tk)}
++
++@router.post("/attention/pause")
++@router.post("/attention/processing/pause")
++def pause_attention_processing(board: Optional[str] = _BOARD_Q):
++    _require_superagent_enabled()
++    with _board_conn(board) as (board, conn):
++        superagent_pause.set_paused(conn, True)
++        return {"ok": True, "paused": True}
++
++@router.post("/attention/resume")
++@router.post("/attention/processing/resume")
++def resume_attention_processing(board: Optional[str] = _BOARD_Q):
++    _require_superagent_enabled()
++    with _board_conn(board) as (board, conn):
++        return {"ok": True, "paused": False, "shifted_triggers": superagent_pause.set_paused(conn, False)}
++
++@router.post("/attention/processing")
++def set_attention_processing(payload: Optional[dict[str, Any]] = Body(None), board: Optional[str] = _BOARD_Q):
++    _require_superagent_enabled()
++    p = payload or {}
++    return pause_attention_processing(board=board) if (p.get("paused") is True or p.get("action") == "pause") else resume_attention_processing(board=board)
++
++
+ # --- WebSocket: /events?since=<event_id>&board=<slug> ------------------------
+ 
+ # Event tail poll interval: WAL + 300 ms polling is the simplest robust approach (negligible CPU).

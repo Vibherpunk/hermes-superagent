@@ -1,0 +1,156 @@
+diff --git a/tui_gateway/methods_prompt.py b/tui_gateway/methods_prompt.py
+index b0957e335c..d06304175f 100644
+--- a/tui_gateway/methods_prompt.py
++++ b/tui_gateway/methods_prompt.py
+@@ -813,6 +813,51 @@ def _lock_in_submit_turn(
+ from gateway.session_surface import SURFACES as _CLIENT_SURFACES
+ 
+ 
++def _sa_snapshot_envelopes(session) -> list:
++    """Snapshot queued envelopes as (object_reference, text) pairs (A31-8).
++
++    The envelope OBJECT is held, not just its id(): a detached id() can be
++    recycled after garbage collection and proves nothing about identity.
++    """
++    snapshot = []
++    envelopes = []
++    if session.get("queued_prompt"):
++        envelopes.append(session["queued_prompt"])
++    envelopes.extend(session.get("queued_prompts") or [])
++    for envelope in envelopes:
++        if isinstance(envelope, dict):
++            snapshot.append((envelope, envelope.get("text")))
++    return snapshot
++
++
++def _sa_envelope_landed(session, snapshot, text) -> bool:
++    """Whether a busy submit's text actually landed in the queue (A31-8).
++
++    Landed iff any of: (i) a fresh envelope (not a held snapshot object)
++    whose text equals the submitted text; (ii) a held envelope whose
++    non-empty snapshot text grew by exactly "\\n\\n" + text (the merge
++    form); (iii) a held envelope whose snapshot text was empty and whose
++    text is now exactly the submitted text (``prev or text``). A dropped
++    self-duplicate satisfies none of these and records nothing.
++    """
++    current = []
++    if session.get("queued_prompt"):
++        current.append(session["queued_prompt"])
++    current.extend(session.get("queued_prompts") or [])
++    for envelope in current:
++        if not isinstance(envelope, dict):
++            continue
++        if all(envelope is not held for held, _ in snapshot) and envelope.get("text") == text:
++            return True
++    for held, old_text in snapshot:
++        now_text = held.get("text")
++        if old_text and now_text == f"{old_text}\n\n{text}":
++            return True
++        if not old_text and now_text == text and bool(text):
++            return True
++    return False
++
++
+ @method("prompt.submit")
+ def _(rid, params: dict) -> dict:
+     from hermes_cli.input_sanitize import sanitize_user_prompt_text
+@@ -847,6 +892,37 @@ def _(rid, params: dict) -> dict:
+     hosted_task = params.get("_hosted_task")
+     hosted_terminal_callback = params.get("_hosted_terminal_callback")
+     internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
++    # U3 eligibility (surfaces Rev 3 §3/U3.2): computed once, after
++    # turn_author / internal_hosted_submit are resolved. Recording happens
++    # ONLY at the three accepted-dispatch points below (busy-accepted,
++    # isolated-dispatch success, post-persist inline) — every refusal
++    # before those points (hosted, fence, slot incl. owner-forwarding,
++    # reattach, lock-in) records nothing; an owner-forwarded submit
++    # records exactly once on the OWNER side when its own prompt.submit
++    # accepts it through its own points.
++    _sa_eligible = (
++        isinstance(text, str) and bool(text.strip())
++        and display_kind != "hidden"  # widget intents + the onboarding opening
++        and not internal_hosted_submit
++        and turn_author is None  # bot-relay submits: authored on another gateway
++        and not session.get("room_plumbing")
++        and not session.get("pending_hidden")
++    )
++
++    def _sa_record() -> None:
++        if not _sa_eligible:
++            return
++        try:
++            from hermes_cli.superagent_inbound import record_local_turn, scope_for_profile_home
++
++            record_local_turn(
++                thread_key=session.get("session_key") or "",
++                body=text,
++                scope=scope_for_profile_home(session.get("profile_home")),
++            )
++        except Exception:  # the helper never raises; belt-and-braces at the seam
++            logger.debug("superagent local record failed", exc_info=True)
++
+     err = (
+         _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback)
+         if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
+@@ -900,10 +976,23 @@ def _(rid, params: dict) -> dict:
+             # built for exactly this race — see desktop's `runRewindSubmit`) waits
+             # for `running` to clear and resubmits with the truncation intact.
+             return _err(rid, 4009, "session busy")
++        # Point A snapshot (A31-8): hold envelope object references +
++        # their texts BEFORE the busy call, so the landed check can tell
++        # a landed envelope from a dropped self-duplicate.
++        _sa_snapshot = _sa_snapshot_envelopes(session) if _sa_eligible else []
+         busy_response = _handle_busy_submit(
+             rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
+             display_kind=display_kind)
+         if busy_response is not None:
++            # Point A (busy-accepted): steered/redirected record directly
++            # (an accepted correction, returned only on success); queued
++            # records only if an envelope actually landed.
++            if _sa_eligible and "error" not in busy_response:
++                _sa_status = (busy_response.get("result") or {}).get("status")
++                if _sa_status in ("steered", "redirected"):
++                    _sa_record()
++                elif _sa_status == "queued" and _sa_envelope_landed(session, _sa_snapshot, text):
++                    _sa_record()
+             return busy_response
+     raw_rebind_ids = params.get("rebind_survivor_row_ids")
+     requested_rebind_ids = (
+@@ -933,6 +1022,8 @@ def _(rid, params: dict) -> dict:
+         isolated_response = _submit_prompt_to_compute_host(
+             rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata)
+         if not isolated_response.get("error"):
++            # Point B1 (isolated dispatch): the turn was accepted here.
++            _sa_record()
+             # The truncation already happened inline above (memory + DB).
+             isolated_response["result"].update(survivor_fields)
+             return isolated_response
+@@ -949,6 +1040,9 @@ def _(rid, params: dict) -> dict:
+             isolated_response["error"].get("message", "unknown error"))
+     if (err := _persist_session_row_for_submit(rid, session, text, display_kind)) is not None:
+         return err
++    # Point B2 (inline dispatch): the last refusal has passed; the turn
++    # is accepted and about to be built/started.
++    _sa_record()
+     # Capture before starting the worker: it consumes the staging dict and may finish before the RPC returns.
+     staged_user = session.get("_submit_user_row") or {}
+     if isinstance(staged_user.get("_row_id"), int):
+diff --git a/tui_gateway/session_compression.py b/tui_gateway/session_compression.py
+index 2d10ea89e7..82039057f7 100644
+--- a/tui_gateway/session_compression.py
++++ b/tui_gateway/session_compression.py
+@@ -329,6 +329,14 @@ def _sync_session_key_after_compress(
+         )
+     # Even if the approval module fails to import, anchor session_key on the continuation id.
+     session["session_key"] = new_session_id
++    # U3b (surfaces Rev 3): move Super Agent subscriptions old -> new key
++    # so follow-ups on the rotated key still fan out to their ticket.
++    # Same gating as record_local_turn inside the helper (no SA writes
++    # when disabled / local not piloted); never raises into compression.
++    with contextlib.suppress(Exception):
++        from hermes_cli.superagent_inbound import alias_thread_key
++
++        alias_thread_key(old_key, new_session_id)
+     with contextlib.suppress(Exception):
+         from tools import approval
+         with contextlib.suppress(Exception):

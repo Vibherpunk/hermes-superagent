@@ -1,0 +1,214 @@
+diff --git a/cli-config.yaml.example b/cli-config.yaml.example
+index 170dac3412..a718e2b69f 100644
+--- a/cli-config.yaml.example
++++ b/cli-config.yaml.example
+@@ -410,6 +410,31 @@ model:
+ kanban:
+   review_dispatch: true
+ 
++# =============================================================================
++# Super-agent Configuration
++# =============================================================================
++# Super-agent (executor-pack Phase 0). enabled: false = stock Hermes behavior; nothing in this build activates unless enabled is set true.
++superagent:
++  enabled: false            # master switch; false = today's Hermes, untouched
++  accept_mode: observe      # off | observe | auto
++  eval_timeout_seconds: 60
++  worker_slots: 4
++  human_reserve_slots: 1
++  router_model: null        # {provider, model} or null = profile default
++  worker_model: null
++  rules: []                 # [{name, instruction}]
++  # Example rule pack:
++  # rules:
++  #   - name: "reproduce-first"
++  #     instruction: "on a bug report in an auto Source, reproduce before replying; deliver only if reproduced AND the fix is <50 lines; otherwise record silently."
++  #
++  # Silence-rule note: sources/rules may mark work record-only — no reply, no
++  # acknowledgement — and silence is a valid, intended outcome, not a failure.
++  github:
++    repository: null        # "owner/name" or null = Source off
++    receive_all: {issues: false, pull_requests: false, comments: false, ci: false}
++  sources: {}               # per-source parts: {<source>: {allowlist: [], admission: {}, bots: []}}
++
+ # =============================================================================
+ # Terminal Tool Configuration
+ # =============================================================================
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index 5fc93b38a1..c84b8f50ec 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -1098,7 +1098,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
+             from hermes_cli.config_home import config_load_issue
+             return [config_load_issue(exc)]
+ 
+-    from hermes_cli.config_value_checks import _validate_timezone, _validate_voice, _validate_web_backends
++    from hermes_cli.config_value_checks import _validate_timezone, _validate_voice, _validate_web_backends, _validate_superagent
+     issues: list[ConfigIssue] = []
+     _validate_voice(config, issues)
+     _validate_timezone(config, issues)
+@@ -1128,6 +1128,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
+                    f"Move '{key}' under the appropriate section")
+ 
+     _validate_web_backends(config, issues)
++    _validate_superagent(config, issues)
+     _validate_quoted_containers(config, issues)
+     return issues
+ 
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 8ac69a3c86..5031b762b4 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -1948,6 +1948,45 @@ DEFAULT_CONFIG = {
+         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
+         # keeps orphans frozen for manual forensics.
+         "reconcile_orphans": True,
++        # Super Agent steps 1-3 (DESIGN rev 4, §5): all three sub-features live
++        # under this board-owned kanban: block and are read ONLY through
++        # hermes_cli.kanban_board_config.load_board_config (the board-owning
++        # home), never through a completing process's ambient profile.  Each
++        # defaults OFF; deploy enables them in the live board config only.
++        "gates": {
++            "enabled": False,  # THE enable condition for step 1 (enforced script gates)
++            "max_attempts_per_run": 3,
++            "default_timeout_seconds": 300,
++            "env_failure_limit": 3,
++            # Cross-run refused-run budget (AMENDMENT-DESIGN-REV2 §A4.4 R-4): a persistently
++            # refused card dispatches at most (escalation threshold + 1) x this many sessions
++            # before the typed block. NOTE: this key is unknown to pre-amendment code — during a
++            # code rollback it must be removed from the live config BEFORE the revert (§A8.6).
++            "max_refused_runs": 3,
++            "apply_default_spec": False,
++            "default_specs": {},  # {work_class: <gate spec object>} — shipped empty, v1-inert
++        },
++        "assignment": {
++            "enabled": False,  # THE enable condition for step 2 (deterministic model assignment)
++            "frontier_primary": "argon",  # "argon" | "opus" — which frontier seat backs the frontier class
++            # Model/provider STRINGS ONLY (ruling 9): no reasoning_effort keys and
++            # no per-class mapping keys — either is a validation error (§5.1).
++            "seats": {
++                "argon": {"model": "gemini-4-argon", "provider": "custom:antigravity-bridge"},
++                "opus": {"model": "anthropic/claude-opus-5.5", "provider": "openrouter"},
++                "cheap": {"model": "mtplx-bonsai-2-27b-optimized-speed", "provider": "custom:bonsai-local"},
++            },
++            "sa_rule_map": {},  # {decision rule id: work_class} — shipped empty, v1-inert
++            "sa_source_defaults": {"github": "coding", "vibehard": "production", "default": "personal"},
++        },
++        "escalation": {
++            "enabled": False,  # THE enable condition for step 3 (coded escalation + spend ceiling)
++            "threshold": 2,
++            # Tokens + runs only (ruling 8); no USD keys exist.
++            "ceilings": {
++                "default": {"max_total_tokens": 2000000, "max_runs": 12},
++            },
++        },
+         # Notify subscriptions survive `done` (completion is reversible) and are removed on archive.
+         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
+         # activity for this many days so stale rows aren't scanned forever. 0 = off.
+@@ -2701,6 +2740,31 @@ DEFAULT_CONFIG = {
+     },
+     # Managed llama.cpp runtime (docs: user-guide/local-models): official binaries, one supervised
+     # llama-server in router mode. No context/VRAM knobs by design.
++    # Super-agent (executor-pack Phase 0). enabled: false = stock Hermes behavior;
++    # nothing in this build activates unless enabled is set true.
++    "superagent": {
++        "enabled": False,
++        "accept_mode": "observe",  # off | observe | auto
++        "eval_timeout_seconds": 60,
++        "worker_slots": 4,
++        "human_reserve_slots": 1,
++        "router_profile": None,
++        "router_model": None,
++        "worker_model": None,
++        "rules": [],
++        "mandate_scope_defaults": [],  # empty = built-in restore-to-intended default applies (see hermes_cli/orchestrator.py)
++        "github": {
++            "repository": None,
++            "receive_all": {"issues": False, "pull_requests": False, "comments": False, "ci": False},
++        },
++        "vibehard": {
++            "enabled": False,
++            "ledger_path": "~/.vibehard-agent/ledger.sqlite",
++            "stuck_after_seconds": 1800,
++        },
++        "sources": {},
++        "passthrough": True,
++    },
+     "local_runtime": {
+         # Off = detection-only (Hermes still finds an external llama-server you run).
+         "enabled": False,
+diff --git a/hermes_cli/config_value_checks.py b/hermes_cli/config_value_checks.py
+index 14c5bd5ad8..2fbfb2a191 100644
+--- a/hermes_cli/config_value_checks.py
++++ b/hermes_cli/config_value_checks.py
+@@ -73,3 +73,70 @@ def _validate_web_backends(config: dict[str, Any], issues: list[ConfigIssue]) ->
+                    f"web.{_key} is set to '{_val}', but {note} — "
+                    "web_search/web_extract will fail until it is changed",
+                    "Run 'hermes tools' and pick a different Web Search & Extract provider")
++
++
++def _validate_superagent(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
++    """Validate superagent block per E-033:
++    accept_mode in {off, observe, auto}, worker_slots >= 1, human_reserve_slots in {0, 1}.
++    """
++    sa_cfg = config.get("superagent")
++    if sa_cfg is None:
++        return
++    if not isinstance(sa_cfg, dict):
++        _issue(issues, "error", f"superagent must be a mapping, got {type(sa_cfg).__name__}",
++               "Configure superagent as a YAML mapping")
++        return
++
++    if "accept_mode" in sa_cfg:
++        mode = sa_cfg.get("accept_mode")
++        if mode not in {"off", "observe", "auto"}:
++            _issue(issues, "error",
++                   f"superagent.accept_mode must be 'off', 'observe', or 'auto', got {mode!r}",
++                   "Set superagent.accept_mode to off, observe, or auto")
++
++    if "worker_slots" in sa_cfg:
++        slots = sa_cfg.get("worker_slots")
++        if not isinstance(slots, int) or isinstance(slots, bool) or slots < 1:
++            _issue(issues, "error",
++                   f"superagent.worker_slots must be an integer >= 1, got {slots!r}",
++                   "Set superagent.worker_slots to at least 1")
++
++    if "human_reserve_slots" in sa_cfg:
++        res = sa_cfg.get("human_reserve_slots")
++        if not isinstance(res, int) or isinstance(res, bool) or res not in {0, 1}:
++            _issue(issues, "error",
++                   f"superagent.human_reserve_slots must be 0 or 1, got {res!r}",
++                   "Set superagent.human_reserve_slots to 0 or 1")
++
++    if "router_profile" in sa_cfg:
++        rp = sa_cfg.get("router_profile")
++        if rp is not None and (not isinstance(rp, str) or not rp.strip()):
++            _issue(issues, "error",
++                   f"superagent.router_profile must be a non-empty string or null, got {rp!r}",
++                   "Set superagent.router_profile to a profile name string or null")
++
++    if "passthrough" in sa_cfg:
++        pt = sa_cfg.get("passthrough")
++        if not isinstance(pt, bool):
++            _issue(issues, "error",
++                   f"superagent.passthrough must be a boolean, got {pt!r}",
++                   "Set superagent.passthrough to true or false")
++
++    if "vibehard" in sa_cfg:
++        vh = sa_cfg.get("vibehard")
++        if vh is not None and not isinstance(vh, dict):
++            _issue(issues, "error",
++                   f"superagent.vibehard must be a mapping, got {type(vh).__name__}",
++                   "Configure superagent.vibehard as a YAML mapping")
++        elif isinstance(vh, dict):
++            if "enabled" in vh and not isinstance(vh["enabled"], bool):
++                _issue(issues, "error",
++                       f"superagent.vibehard.enabled must be a boolean, got {vh['enabled']!r}",
++                       "Set superagent.vibehard.enabled to true or false")
++            if "stuck_after_seconds" in vh:
++                sas = vh["stuck_after_seconds"]
++                if not isinstance(sas, int) or isinstance(sas, bool) or sas < 1:
++                    _issue(issues, "error",
++                           f"superagent.vibehard.stuck_after_seconds must be an integer >= 1, got {sas!r}",
++                           "Set superagent.vibehard.stuck_after_seconds to at least 1")
++

@@ -1,0 +1,238 @@
+diff --git a/gateway/run_inbound.py b/gateway/run_inbound.py
+index 2867e3e0a5..7d45868667 100644
+--- a/gateway/run_inbound.py
++++ b/gateway/run_inbound.py
+@@ -1239,6 +1239,225 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
+             raise RuntimeStoreError('profile_mismatch')
+         return False, None
+ 
++    def _hm_resolve_superagent_config(self) -> dict[str, Any] | None:
++        """Resolve the superagent configuration block, if available.
++
++        Delegates to the shared helper in hermes_cli/superagent_inbound.py
++        (surfaces Rev 3, U3.1). The getattr(..., None) forms are mandatory:
++        the live runner has no ``superagent`` attribute, and this hook is
++        called outside its own swallow, so the delegation must never raise.
++        """
++        from hermes_cli.superagent_inbound import resolve_superagent_config
++        return resolve_superagent_config(
++            config=getattr(self, "config", None),
++            superagent=getattr(self, "superagent", None))
++
++    def _hm_maybe_record_superagent_trigger(self, event: MessageEvent, source: SessionSource) -> None:
++        """Inbound hook to persist an admitted message event into sa_triggers when superagent is enabled.
++
++        Only active when superagent.enabled is True and the event's surface is in superagent.pilot_surfaces.
++        Failures are swallowed and logged so they never break the turn.
++        """
++        sa_cfg = self._hm_resolve_superagent_config()
++        if not sa_cfg or not sa_cfg.get("enabled", False):
++            return
++
++        surface = (
++            getattr(event, "surface", None)
++            or getattr(source, "surface", None)
++            or getattr(getattr(source, "platform", None), "value", None)
++            or str(getattr(source, "platform", "") or "")
++        )
++        surface_key = str(getattr(surface, "value", surface)).strip().lower()
++
++        # U2 rule (surfaces Rev 3 §3/U2, addendum A31-5/A31-9): scoped to
++        # exactly the surfaces this delegation arms — {telegram, api_server,
++        # local}. Inserted immediately after surface_key is derived and
++        # BEFORE the pilot-surface check: the enabled check above is the
++        # only return before the _sa_user_turn flag is read; for a
++        # non-piloted armed surface the flag is read (side-effect-free
++        # getattr) and the hook then returns at the pilot check below.
++        if surface_key in ("telegram", "api_server", "local"):
++            _sa_user_turn = getattr(event, "_sa_user_turn", False)
++            if surface_key in ("api_server", "local"):
++                # Sub-rule 1 (api_server/local only): gateway-local events
++                # split into machine deliveries and genuine user turns.
++                # Machine deliveries (Bot Chat / automation / wakes) can
++                # drain with a LOCAL source on a rebuilt event, so they
++                # are excluded HERE (addendum A31-9) — by their markers,
++                # not by platform alone: a 'bot:' message id, a
++                # turn_author metadata entry, a notification_category
++                # metadata entry, or the internal-notification text wrap.
++                # A gateway-local event carrying NONE of those markers is
++                # a real user turn (the desktop app's gateway sessions —
++                # live evidence 2026-11-04: the owner's desktop turns
++                # arrive on this path, not the TUI seam) and proceeds to
++                # candidacy; the policy layer decides admission.
++                _platform = getattr(source, "platform", None)
++                _platform_value = getattr(_platform, "value", None) or (
++                    str(_platform) if _platform is not None else ""
++                )
++                if str(_platform_value).strip().lower() == "local":
++                    _md = getattr(event, "metadata", None)
++                    if not isinstance(_md, dict):
++                        _md = {}
++                    _mid = str(getattr(event, "message_id", "") or "")
++                    _text = str(
++                        getattr(event, "text", None)
++                        or getattr(event, "message", "")
++                        or ""
++                    )
++                    if (
++                        _mid.startswith("bot:")
++                        or "turn_author" in _md
++                        or "notification_category" in _md
++                        or "[INTERNAL NOTIFICATION" in _text
++                    ):
++                        return
++            # Sub-rule 2 (all three surfaces): an internal event that is
++            # not a flagged API user turn is a machine/producer delivery
++            # (kanban/loop wakes, notification self-posts, automation,
++            # startup resume replays, handoff synthetics, process
++            # notifications, plugin injections, goal wakeups) — never a
++            # candidacy. On telegram _sa_user_turn is never set, so every
++            # internal telegram event is excluded; human telegram turns
++            # arrive internal=False and are untouched.
++            if getattr(event, "internal", False) and not _sa_user_turn:
++                return
++            # Sub-rule 3 (all three surfaces): bot-flagged events never
++            # record — the admission gate checks first-party before its
++            # bot check, so the recorder enforces this exclusion (same
++            # flag sources as step 5 below).
++            if bool(
++                getattr(source, "is_bot", False)
++                or getattr(event, "is_bot", False)
++                or (getattr(event, "metadata", None) or {}).get("is_bot", False)
++            ):
++                return
++
++        pilot = sa_cfg.get("pilot_surfaces") or []
++        pilot_set = {str(getattr(s, "value", s)).strip().lower() for s in ([pilot] if isinstance(pilot, str) else pilot) if s}
++        if surface_key not in pilot_set:
++            return
++
++        # 1. source = the platform/source of the event
++        source_name = getattr(getattr(source, "platform", None), "value", None) or str(getattr(source, "platform", "") or "") or surface_key
++        source_name = str(source_name).strip().lower()
++
++        # 2. scope = the receiving scope key for the surface
++        scope = str(
++            getattr(event, "scope", None)
++            or getattr(source, "scope", None)
++            or getattr(source, "scope_id", None)
++            or getattr(source, "guild_id", None)
++            or getattr(source, "chat_id", None)
++            or "default"
++        ).strip()
++
++        # 3. thread_key built from the SAME components the gateway uses for session routing:
++        # 1. Profile namespace, 2. Platform, 3. Chat type slot ("dm"/"group"/"thread"),
++        # 4. Scope ID (Slack), 5. Chat ID (WhatsApp canonicalized), 6. Thread ID, 7. Participant ID.
++        if hasattr(self, "_session_key_for_source"):
++            thread_key = self._session_key_for_source(source)
++        else:
++            from gateway.session import build_session_key
++            cfg = getattr(self, "config", None)
++            thread_key = build_session_key(
++                source,
++                group_sessions_per_user=getattr(cfg, "group_sessions_per_user", True),
++                thread_sessions_per_user=getattr(cfg, "thread_sessions_per_user", False),
++                profile=getattr(source, "profile", None),
++            )
++
++        # 4. actor_source_id = the sender's id in that source's identity space (None for sender-less events)
++        uid = getattr(source, "user_id", None) or getattr(event, "user_id", None)
++        actor_source_id = str(uid) if uid is not None and str(uid).strip() else None
++
++        # U2 actor fallback (surfaces Rev 3 §3/U2 edit 3): an api_server
++        # source with no actor records the adapter's own stamped principal
++        # ("api", gateway/session_api.py bind path) — not an invented
++        # person identity — so the fan-out is_person rule can never
++        # double-handle an API follow-up on a legacy-shaped source.
++        if source_name == "api_server" and actor_source_id is None:
++            actor_source_id = "api"
++
++        # 5. actor_is_bot from the event's bot flags if present (else False)
++        actor_is_bot = bool(
++            getattr(source, "is_bot", False)
++            or getattr(event, "is_bot", False)
++            or (getattr(event, "metadata", None) or {}).get("is_bot", False)
++        )
++
++        # 6. addressed = whether the event mentions/addresses the agent per gateway addressing detection.
++        # Reuses event.addressed, event.metadata, reply_to_is_own_message, reply_expected, and DM chat_type.
++        # If none exists for the surface, default to False per spec.
++        if getattr(event, "addressed", None) is not None:
++            addressed = bool(event.addressed)
++        elif getattr(event, "metadata", None) and "addressed" in event.metadata:
++            addressed = bool(event.metadata["addressed"])
++        elif getattr(event, "metadata", None) and "is_mentioned" in event.metadata:
++            addressed = bool(event.metadata["is_mentioned"])
++        elif getattr(event, "reply_to_is_own_message", False):
++            addressed = True
++        elif getattr(event, "reply_expected", None) is not None:
++            addressed = bool(event.reply_expected)
++        elif getattr(source, "chat_type", "") == "dm":
++            addressed = True
++        else:
++            # If none exists for the surface, record False per specification
++            addressed = False
++
++        # 7. kind from the event type
++        mtype = getattr(event, "message_type", None)
++        kind = getattr(event, "kind", None) or (mtype.value if hasattr(mtype, "value") else str(mtype or "message"))
++
++        # 8. body = the message text
++        body = getattr(event, "text", "") or ""
++
++        # 9. idempotency_key = a stable derivation from the platform's message id.
++        # Derivation: stable f"{source}:{message_id}" (or with edit_revision).
++        # Falls back to deterministic SHA-256 hash over thread_key and body if message_id is absent.
++        import hashlib
++        msg_id = getattr(event, "message_id", None) or getattr(source, "message_id", None)
++        if msg_id:
++            rev = getattr(event, "edit_revision", None)
++            idempotency_key = f"{source_name}:{msg_id}:{rev}" if rev else f"{source_name}:{msg_id}"
++        else:
++            h = hashlib.sha256(f"{thread_key}:{body}".encode()).hexdigest()[:16]
++            idempotency_key = f"{source_name}:{thread_key}:{h}"
++
++        from hermes_cli.superagent_inbound import resolve_kanban_db_path
++        db_path = resolve_kanban_db_path(
++            sa_cfg,
++            getattr(self, "_superagent_db_path", None),
++            getattr(self, "_kanban_db_path", None),
++        )
++        if db_path is None:
++            logger.warning("Cannot resolve kanban DB path for superagent trigger")
++            return
++
++        try:
++            from hermes_cli.orchestrator import receive_trigger
++
++            receive_trigger(
++                db_path,
++                source=source_name,
++                scope=scope,
++                thread_key=thread_key,
++                actor_source_id=actor_source_id,
++                actor_is_bot=actor_is_bot,
++                addressed=addressed,
++                kind=kind,
++                body=body,
++                meta=getattr(event, "metadata", None),
++                correlation=None,
++                idempotency_key=idempotency_key,
++                now=time.time(),
++            )
++        except Exception as exc:  # health: allow BLE001 -- a Trigger write failure loses a candidate, a broken turn loses the user
++            # A Trigger write failure loses a candidate, a broken turn loses the user.
++            logger.warning("Failed to record superagent trigger for %s (%s): %s", source_name, idempotency_key, exc, exc_info=True)
++
+     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+         """Handle an incoming message from any platform: auth → command check → running-agent
+         interrupt → get/create session → build context → run agent → return response."""
+@@ -1247,6 +1466,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
+         if _admitted is None:
+             return None
+         event, source, is_internal = _admitted
++        self._hm_maybe_record_superagent_trigger(event, source)
+         if not is_internal:
+             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
+             record_gateway_slash_command(event)

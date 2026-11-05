@@ -1,0 +1,399 @@
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index 49b23a4037..8cab9fe909 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -83,6 +83,7 @@ const DocsPage = lazy(() => import("@/pages/DocsPage"));
+ const EnvPage = lazy(() => import("@/pages/EnvPage"));
+ const FilesPage = lazy(() => import("@/pages/FilesPage"));
+ const SessionsPage = lazy(() => import("@/pages/SessionsPage"));
++const AttentionPage = lazy(() => import("@/pages/AttentionPage"));
+ const LogsPage = lazy(() => import("@/pages/LogsPage"));
+ const AnalyticsPage = lazy(() => import("@/pages/AnalyticsPage"));
+ const ModelsPage = lazy(() => import("@/pages/ModelsPage"));
+@@ -158,6 +159,7 @@ const CHAT_NAV_ITEM: NavItem = {
+ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
+   "/": RootRedirect,
+   "/sessions": SessionsPage,
++  "/attention": AttentionPage,
+   "/files": FilesPage,
+   "/analytics": AnalyticsPage,
+   "/models": ModelsPage,
+@@ -192,6 +194,7 @@ const BUILTIN_NAV_REST: NavItem[] = [
+     label: "Sessions",
+     icon: MessageSquare,
+   },
++  { path: "/attention", label: "Attention", icon: Eye },
+   { path: "/files", label: "Files", icon: FolderOpen },
+   {
+     path: "/analytics",
+diff --git a/web/src/i18n/en.ts b/web/src/i18n/en.ts
+index 9d2fe49138..895fce79ba 100644
+--- a/web/src/i18n/en.ts
++++ b/web/src/i18n/en.ts
+@@ -934,4 +934,79 @@ export const en: Translations = {
+       confirmManyTitle: "Delete {n} tasks?",
+     },
+   },
++
++  attention: {
++    title: "Attention",
++    needsMeTitle: "Needs Attention",
++    needsMeEmpty: "No tickets currently need your attention.",
++    healthTitle: "System Health",
++    paused: "Paused",
++    active: "Active",
++    outboxDue: "Outbox Due",
++    outboxFailed: "Outbox Failed",
++    evalQueued: "Eval Queued",
++    unavailable24h: "Unavailable (24h)",
++    flowCountsTitle: "24h Activity Flow",
++    triggersReceived: "Triggers Received",
++    ticketsCreated: "Tickets Created",
++    repliesSent: "Replies Sent",
++    repliesFailed: "Replies Failed",
++    repliesDropped: "Replies Dropped",
++    executorLoadTitle: "Executor Load",
++    executorLoadSlots: "Slots in Use",
++    executorLoadUnavailable: "Executor slot metrics are not reported by the backend.",
++    otherStagesTitle: "Lifecycle Stages",
++    stages: {
++      delivery: {
++        label: "Delivery Failure",
++        description: "Outbox failed to deliver message to destination",
++      },
++      answer: {
++        label: "Awaiting Answer",
++        description: "Waiting for human answer or input",
++      },
++      review: {
++        label: "Awaiting Review",
++        description: "Waiting for human review or approval",
++      },
++      blocked: {
++        label: "Blocked",
++        description: "Task blocked or execution failed",
++      },
++      working: {
++        label: "Working",
++        description: "Active execution running or claimed by worker",
++      },
++      queued: {
++        label: "Queued",
++        description: "Ready or dispatched for execution",
++      },
++      closed: {
++        label: "Closed",
++        description: "Completed and resolved tasks",
++      },
++      idle: {
++        label: "Idle",
++        description: "Tasks without active dispatch or waiting state",
++      },
++    },
++    ticketDetail: {
++      title: "Ticket Detail",
++      taskSummary: "Task Summary",
++      mandateBasis: "Mandate Basis",
++      amendmentChain: "Amendment Chain",
++      inputs: "Inputs",
++      outbox: "Outbox",
++      strength: "Strength",
++      via: "Via",
++      rules: "Rules",
++      policyVersion: "Policy Version",
++      scope: "Scope",
++      status: "Status",
++      noMandate: "No mandate basis recorded for this ticket.",
++      noAmendments: "No amendments recorded.",
++      noInputs: "No inputs recorded.",
++      noOutbox: "No outbox records.",
++    },
++  },
+ };
+diff --git a/web/src/i18n/types.ts b/web/src/i18n/types.ts
+index cac661b053..a0955f368a 100644
+--- a/web/src/i18n/types.ts
++++ b/web/src/i18n/types.ts
+@@ -923,4 +923,57 @@ export interface Translations {
+       confirmManyTitle?: string;
+     };
+   };
++
++  attention?: AttentionTranslations;
++}
++
++export interface AttentionTranslations {
++  title: string;
++  needsMeTitle: string;
++  needsMeEmpty: string;
++  healthTitle: string;
++  paused: string;
++  active: string;
++  outboxDue: string;
++  outboxFailed: string;
++  evalQueued: string;
++  unavailable24h: string;
++  flowCountsTitle: string;
++  triggersReceived: string;
++  ticketsCreated: string;
++  repliesSent: string;
++  repliesFailed: string;
++  repliesDropped: string;
++  executorLoadTitle: string;
++  executorLoadSlots: string;
++  executorLoadUnavailable: string;
++  otherStagesTitle: string;
++  stages: {
++    delivery: { label: string; description: string };
++    answer: { label: string; description: string };
++    review: { label: string; description: string };
++    blocked: { label: string; description: string };
++    working: { label: string; description: string };
++    queued: { label: string; description: string };
++    closed: { label: string; description: string };
++    idle: { label: string; description: string };
++  };
++  ticketDetail: {
++    title: string;
++    taskSummary: string;
++    mandateBasis: string;
++    amendmentChain: string;
++    inputs: string;
++    outbox: string;
++    strength: string;
++    via: string;
++    rules: string;
++    policyVersion: string;
++    scope: string;
++    status: string;
++    noMandate: string;
++    noAmendments: string;
++    noInputs: string;
++    noOutbox: string;
++  };
+ }
+diff --git a/web/src/lib/api.ts b/web/src/lib/api.ts
+index 567891e09a..50b2b67307 100644
+--- a/web/src/lib/api.ts
++++ b/web/src/lib/api.ts
+@@ -1448,6 +1448,58 @@ export const api = {
+     fetchJSON<SkillHubScan>(
+       `/api/skills/hub/scan?identifier=${encodeURIComponent(identifier)}`,
+     ),
++  // ── Attention endpoints (Superagent Phase 5.3/5.4) ────────────────────
++  getAttentionOverview: (board?: string) => {
++    const url = board
++      ? `/api/plugins/kanban/attention/overview?board=${encodeURIComponent(board)}`
++      : "/api/plugins/kanban/attention/overview";
++    return fetchJSON<AttentionOverviewResponse>(url);
++  },
++  getAttentionTickets: (stage?: string, board?: string) => {
++    const params: string[] = [];
++    if (stage) params.push(`stage=${encodeURIComponent(stage)}`);
++    if (board) params.push(`board=${encodeURIComponent(board)}`);
++    const q = params.length > 0 ? `?${params.join("&")}` : "";
++    return fetchJSON<AttentionTicket[]>(`/api/plugins/kanban/attention/tickets${q}`);
++  },
++  getAttentionTicket: (ticketId: string, board?: string) => {
++    const q = board ? `?board=${encodeURIComponent(board)}` : "";
++    return fetchJSON<AttentionTicketDetailResponse>(
++      `/api/plugins/kanban/attention/ticket/${encodeURIComponent(ticketId)}${q}`,
++    );
++  },
++  getAttentionThreads: (board?: string) => {
++    const q = board ? `?board=${encodeURIComponent(board)}` : "";
++    return fetchJSON<AttentionThreadSummary[]>(
++      `/api/plugins/kanban/attention/threads${q}`,
++    );
++  },
++  getAttentionThread: (threadKey: string, board?: string) => {
++    const q = board ? `?board=${encodeURIComponent(board)}` : "";
++    return fetchJSON<AttentionTimelineEvent[]>(
++      `/api/plugins/kanban/attention/thread/${encodeURIComponent(threadKey)}${q}`,
++    );
++  },
++  getAttentionDecisions: (options?: {
++    outcome?: string;
++    limit?: number;
++    board?: string;
++  }) => {
++    const params: string[] = [];
++    if (options?.outcome) params.push(`outcome=${encodeURIComponent(options.outcome)}`);
++    if (options?.limit !== undefined) params.push(`limit=${options.limit}`);
++    if (options?.board) params.push(`board=${encodeURIComponent(options.board)}`);
++    const q = params.length > 0 ? `?${params.join("&")}` : "";
++    return fetchJSON<AttentionDecision[]>(
++      `/api/plugins/kanban/attention/decisions${q}`,
++    );
++  },
++  getAttentionSettings: (board?: string) => {
++    const q = board ? `?board=${encodeURIComponent(board)}` : "";
++    return fetchJSON<AttentionSettingsResponse>(
++      `/api/plugins/kanban/attention/settings${q}`,
++    );
++  },
+ };
+ 
+ /** Identity payload returned by ``GET /api/auth/me`` (Phase 7).
+@@ -2754,3 +2806,149 @@ export interface PluginProvidersPutRequest {
+   memory_provider?: string;
+   context_engine?: string;
+ }
++
++// ── Attention / Superagent types ───────────────────────────────────────
++
++export interface AttentionTicket {
++  id: string;
++  ticket_id?: string;
++  stage: string;
++  title: string;
++  status: string;
++  block_kind?: string | null;
++  assignee?: string | null;
++  priority?: number;
++  created_at?: number;
++  ticket_kind?: string | null;
++  mandate_id?: number | null;
++}
++
++export interface AttentionHealth {
++  paused: boolean;
++  outbox_due: number;
++  outbox_failed: number;
++  eval_queued: number;
++  unavailable_24h: number;
++}
++
++export interface AttentionFlowCounts {
++  triggers_received: number;
++  decisions_by_outcome: Record<string, number>;
++  tickets_created: number;
++  replies_sent: number;
++  replies_failed: number;
++  replies_dropped: number;
++  replies: {
++    sent: number;
++    failed: number;
++    dropped: number;
++  };
++}
++
++export interface AttentionOverviewResponse {
++  health: AttentionHealth;
++  flow_counts_24h: AttentionFlowCounts;
++  needs_person: AttentionTicket[];
++  needs_person_count: number;
++  stages: Record<string, AttentionTicket[]>;
++  tickets_by_stage: Record<string, AttentionTicket[]>;
++  tickets: AttentionTicket[];
++  dropped_and_failed_replies?: Record<string, unknown>[];
++  executor_load?: {
++    slots_in_use?: number;
++    max_slots?: number;
++    [key: string]: unknown;
++  };
++}
++
++export interface AttentionMandate {
++  id: number;
++  ticket_id: string;
++  policy_version: string;
++  scope: string;
++  strength: string;
++  basis_json?: string;
++  status: string;
++  amended_from?: number | null;
++  created_at: number;
++}
++
++export interface AttentionInput {
++  id: number;
++  ticket_id: string;
++  trigger_id?: string | null;
++  kind: string;
++  body: string | null;
++  is_person?: number | boolean;
++  context_only?: number | boolean;
++  read_at?: number | null;
++  created_at: number;
++}
++
++export interface AttentionOutboxRow {
++  id: number;
++  ticket_id?: string | null;
++  source: string;
++  address_json?: string;
++  purpose: string;
++  body: string;
++  status: string;
++  attempts: number;
++  next_attempt_at?: number;
++  last_error?: string | null;
++  dropped_reason?: string | null;
++  receipt_json?: string;
++  created_at: number;
++  sent_at?: number | null;
++}
++
++export interface AttentionTicketDetailResponse {
++  id: string;
++  title: string;
++  status: string;
++  block_kind?: string | null;
++  assignee?: string | null;
++  priority?: number;
++  created_at?: number;
++  ticket_kind?: string | null;
++  mandate_id?: number | null;
++  description?: string | null;
++  result?: string | null;
++  mandate?: AttentionMandate | null;
++  inputs: AttentionInput[];
++  outbox: AttentionOutboxRow[];
++  task?: Record<string, unknown>;
++}
++
++export interface AttentionDecision {
++  id: number;
++  thread_key: string;
++  outcome: string;
++  strength?: string;
++  policy_version?: string;
++  ticket_id?: string | null;
++  reason?: string | null;
++  created_at: number;
++}
++
++export interface AttentionTimelineEvent {
++  ts: number;
++  kind: "trigger" | "decision" | "input" | string;
++  summary: string;
++}
++
++export interface AttentionThreadSummary {
++  thread_key: string;
++  latest_trigger_ts?: number;
++  latest_decision_ts?: number;
++  latest_outcome?: string;
++  [key: string]: unknown;
++}
++
++export interface AttentionSettingsResponse {
++  mode?: string;
++  enabled?: boolean;
++  paused?: boolean;
++  surfaces?: Record<string, unknown>;
++  [key: string]: unknown;
++}
+diff --git a/web/src/lib/resolve-page-title.ts b/web/src/lib/resolve-page-title.ts
+index 15fa5b3824..ae9a035bae 100644
+--- a/web/src/lib/resolve-page-title.ts
++++ b/web/src/lib/resolve-page-title.ts
+@@ -19,6 +19,7 @@ const BUILTIN: Record<string, keyof Translations["app"]["nav"]> = {
+ // sidebar labels in App.tsx — the naive capitalize fallback below mangles
+ // initialisms ("/mcp" → "Mcp") and can't match multi-word labels.
+ const BUILTIN_LITERAL: Record<string, string> = {
++  "/attention": "Attention",
+   "/files": "Files",
+   "/mcp": "MCP",
+   "/channels": "Channels",

@@ -1,0 +1,261 @@
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e1c36a8111..5ed45d9552 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -360,6 +360,45 @@ def _cmd_create(args: argparse.Namespace) -> int:
+     if max_retries is not None and max_retries < 1:
+         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
+                     "use 1 to trip on the first failure.", 2)
++    # Gate spec + deterministic assignment (DESIGN rev 4, §2.1/§3.3): the
++    # assignment is PRECOMPUTED here, before create_task opens its txn (B-9).
++    gate_spec_arg = None
++    gate_spec_file = getattr(args, "gate_spec", None)
++    gate_checks = getattr(args, "gate_check", None) or []
++    if gate_spec_file and gate_checks:
++        return _err("kanban: --gate-spec and --gate-check are mutually exclusive", 2)
++    if gate_spec_file:
++        try:
++            gate_spec_arg = json.loads(Path(gate_spec_file).read_text(encoding="utf-8-sig"))
++        except (OSError, ValueError) as exc:
++            return _err(f"kanban: --gate-spec: {exc}", 2)
++    elif gate_checks:
++        try:
++            gate_spec_arg = {"version": 1, "checks": [json.loads(c) for c in gate_checks]}
++        except ValueError as exc:
++            return _err(f"kanban: --gate-check: {exc}", 2)
++    assignment_hook = None
++    work_class_arg = getattr(args, "work_class", None)
++    try:
++        from hermes_cli import kanban_assignment as _ka_cli
++        from hermes_cli import kanban_board_config as _kbcfg_cli
++
++        _cli_cfg, _cli_errs = _kbcfg_cli.load_board_config()
++        if _kbcfg_cli.feature_enabled(_cli_cfg, _cli_errs, "assignment"):
++            _cli_plan = _ka_cli.resolve_assignment(
++                work_class_arg, board_config=_cli_cfg,
++                explicit=_ka_cli.ExplicitOverrides(
++                    model=getattr(args, "model_override", None),
++                    provider=getattr(args, "provider_override", None),
++                    reasoning_effort=getattr(args, "reasoning_effort", None),
++                ),
++                assignee=args.assignee,
++            )
++
++            def assignment_hook(_conn, _tid, _plan=_cli_plan):
++                _ka_cli.apply_creation_assignment(_conn, _tid, _plan)
++    except ValueError as exc:
++        return _err(f"kanban: {exc}", 2)
+     with kbc.connect_closing() as conn:
+         task_id = kb.create_task(
+             conn, title=args.title, body=body, assignee=args.assignee,
+@@ -373,11 +412,21 @@ def _cmd_create(args: argparse.Namespace) -> int:
+             provider_override=getattr(args, "provider_override", None),
+             goal_mode=bool(getattr(args, "goal_mode", False)),
+             goal_max_turns=getattr(args, "goal_max_turns", None),
++            reasoning_effort=getattr(args, "reasoning_effort", None),
+             completion_contract=getattr(args, "completion_contract", None),
++            gate_spec=gate_spec_arg,
++            work_class=work_class_arg,
++            assignment_hook=assignment_hook,
+             initial_status=getattr(args, "initial_status", "running"),
+             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                              if is_dispatcher_owned_worker_context() else None),
+         )
++        # FIX-4: the assignment consumer surfaces ONLY its own section's
++        # errors, on the task it just created, when the feature is enabled.
++        try:
++            _kbcfg_cli.surface_if_exercised(conn, task_id, _cli_cfg, _cli_errs, "assignment")
++        except NameError:
++            pass  # precompute imports failed before names were bound; create already failed visibly in that case
+         task = kb.get_task(conn, task_id)
+     if getattr(args, "json", False):
+         _print_json(_task_to_dict(task))
+@@ -921,12 +970,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
+             try:
+                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
+                                         expected_run_id=_worker_run_id_for(tid),
+-                                        force=bool(getattr(args, "force", False)))
++                                        force=bool(getattr(args, "force", False)),
++                                        gate_bypass_reason=getattr(args, "gate_bypass_reason", None),
++                                        gate_bypass_actor=(_profile_author() if getattr(args, "gate_bypass_reason", None) else None))
+             except kb.LiveClaimError:
+                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
+                                  f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
+                                  f"--force to close its run and complete anyway.")
+                 return False
++            except kb.GateFailedError as gate_err:
++                fail_msg[tid] = (f"cannot complete {tid}: gate check failed "
++                                 f"({'run exhausted; card re-queued or blocked' if gate_err.exhausted else 'fix and retry'}): "
++                                 f"{gate_err}")
++                return False
++            except kb.GateEnvError as gate_env_err:
++                fail_msg[tid] = f"cannot complete {tid}: gate environment failure: {gate_env_err}"
++                return False
+             except kb.EmptyCompletionError as empty_err:
+                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
+                                  f"describing what was done (an empty completion is not evidence).")
+@@ -953,7 +1012,16 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+     priority = getattr(args, "priority", None)
+     if result is None and (summary is not None or raw_metadata is not None):
+         return _err("kanban edit: --summary and --metadata require --result", 2)
+-    if all(value is None for value in (title, body, priority, result)):
++    gate_spec_edit = None
++    gate_spec_file_edit = getattr(args, "gate_spec", None)
++    if gate_spec_file_edit:
++        try:
++            gate_spec_edit = json.loads(Path(gate_spec_file_edit).read_text(encoding="utf-8-sig"))
++        except (OSError, ValueError) as exc:
++            return _err(f"kanban: --gate-spec: {exc}", 2)
++    work_class_edit = getattr(args, "work_class", None)
++    if all(value is None for value in (title, body, priority, result)) \
++            and gate_spec_edit is None and work_class_edit is None:
+         return _err("kanban edit: provide --title, --body, --priority, or --result", 2)
+     metadata, rc = _parse_metadata_flag(raw_metadata)
+     if rc:
+@@ -962,6 +1030,7 @@ def _cmd_edit(args: argparse.Namespace) -> int:
+         ok = kb.edit_task(
+             conn, args.task_id, title=title, body=body, priority=priority,
+             result=result, summary=summary, metadata=metadata,
++            gate_spec=gate_spec_edit, work_class=work_class_edit,
+         )
+     return _ok_or_err(
+         ok,
+@@ -1317,6 +1386,38 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
+                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
+ 
+ 
++def _cmd_verdict(args: argparse.Namespace) -> int:
++    """File a sha-bound reviewer verdict (§4.2) via kanban_escalation.file_verdict."""
++    if args.action != "file":
++        return _err(f"kanban: unknown verdict action {args.action!r}", 2)
++    from hermes_cli import kanban_board_config as _kbcfg_v
++    from hermes_cli import kanban_escalation as _ke_v
++
++    _v_cfg, _v_errs = _kbcfg_v.load_board_config()
++    _v_enabled = _kbcfg_v.feature_enabled(_v_cfg, _v_errs, "escalation")
++    _v_threshold = int(_kbcfg_v.section_config(_v_cfg, "escalation").get("threshold", 2))
++    with kbc.connect_closing() as conn:
++        result = _ke_v.file_verdict(
++            conn, args.task, source_path_or_payload=args.file,
++            filed_by=_profile_author(), board_config=_v_cfg,
++            escalation_enabled=_v_enabled, threshold=_v_threshold,
++        )
++        # FIX-4: the escalation consumer surfaces ONLY its own section's errors.
++        _kbcfg_v.surface_if_exercised(conn, args.task, _v_cfg, _v_errs, "escalation")
++    print(json.dumps(result, indent=2, sort_keys=True, default=str))
++    return 0 if result.get("filed") else 2
++
++
++def _cmd_set_spend_ceiling(args: argparse.Namespace) -> int:
++    tokens = None if getattr(args, "clear", False) else getattr(args, "tokens", None)
++    with kbc.connect_closing() as conn:
++        ok = kb.set_spend_ceiling(conn, args.task_id, tokens=tokens)
++    if not ok:
++        return _err(f"kanban: cannot set spend ceiling for {args.task_id} (unknown id)", 2)
++    print(f"Spend ceiling for {args.task_id}: tokens={tokens if tokens is not None else '(config default)'}")
++    return 0
++
++
+ _HANDLERS = {
+     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
+@@ -1337,6 +1438,7 @@ _HANDLERS = {
+     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
+     "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
+     "gc": _cmd_gc,
++    "verdict": _cmd_verdict, "set-spend-ceiling": _cmd_set_spend_ceiling,
+ }
+ 
+ 
+diff --git a/hermes_cli/kanban_db_context.py b/hermes_cli/kanban_db_context.py
+index 4f204c7cc9..f05d800dc4 100644
+--- a/hermes_cli/kanban_db_context.py
++++ b/hermes_cli/kanban_db_context.py
+@@ -154,6 +154,44 @@ def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str
+         lines.append("")
+ 
+ 
++def _ctx_gate_evidence(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
++    """Gate evidence for the next worker (DESIGN rev 4, §2.4): the most recent
++    2 ``gate_failed``/``gate_env_failed`` events, each output tail capped at
++    3,000 chars, under a fixed heading."""
++    try:
++        rows = conn.execute(
++            "SELECT kind, payload FROM task_events WHERE task_id = ? "
++            "AND kind IN ('gate_failed', 'gate_env_failed') ORDER BY id DESC LIMIT 2",
++            (task_id,),
++        ).fetchall()
++    except Exception:
++        return
++    if not rows:
++        return
++    lines.append("## Gate evidence (must pass before completion)")
++    for row in rows:
++        payload = _kb._json_dict(row["payload"]) if hasattr(_kb, "_json_dict") else {}
++        if not payload:
++            try:
++                import json as _json
++                payload = _json.loads(row["payload"] or "{}")
++            except Exception:
++                payload = {}
++        failed = payload.get("failed_check") or payload.get("env_reason") or row["kind"]
++        lines.append(f"### {row['kind']} — {failed}")
++        for check in payload.get("checks") or []:
++            if not isinstance(check, dict) or check.get("skipped"):
++                continue
++            tail = str(check.get("output_tail") or "")[:3000]
++            lines.append(
++                f"- check `{check.get('id')}` exit_code={check.get('exit_code')} "
++                f"timed_out={check.get('timed_out')}"
++            )
++            if tail:
++                lines.append(tail[:3000])
++        lines.append("")
++
++
+ def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+     """Done-parent handoffs: newest ``completed`` run's summary+metadata,
+     falling back to ``task.result`` for pre-runs-table data. Stamped with a
+diff --git a/hermes_cli/kanban_parser.py b/hermes_cli/kanban_parser.py
+index 8a65d41346..5af4f96494 100644
+--- a/hermes_cli/kanban_parser.py
++++ b/hermes_cli/kanban_parser.py
+@@ -205,6 +205,16 @@ _SPECS = [
+                   "the worker). Requires --model."),
+         _arg("--completion-contract", metavar="CONTRACT",
+              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
++        _arg("--gate-spec", metavar="PATH",
++             help="Path to a JSON gate spec file (DESIGN rev 4 §2.1): checks that must "
++                  "pass before the card can complete. Mutually exclusive with --gate-check."),
++        _arg("--gate-check", action="append", default=[], metavar="JSON",
++             help="One gate check as a JSON object (repeatable). Mutually exclusive with --gate-spec."),
++        _arg("--work-class", metavar="CLASS",
++             help="Deterministic assignment class: financial|production|architecture|coding|"
++                  "mechanical|repair|personal|general (§3)."),
++        _arg("--reasoning-effort", dest="reasoning_effort", metavar="LEVEL",
++             help="Pin the worker's reasoning effort (minimal|low|medium|high|xhigh|max|ultra|none)."),
+         _arg("--goal", action="store_true", dest="goal_mode",
+              help="Run the worker in a goal loop: after each turn a judge checks the "
+                   "response against the card title/body and, if not done, the worker "
+@@ -303,7 +313,21 @@ _SPECS = [
+         _arg("--force", action="store_true",
+              help="Override the live-claim guard: complete a running, claimed task "
+                   "even without owning its run (closes the worker's run)."),
++        _arg("--gate-bypass-reason", metavar="TEXT",
++             help="Operator gate bypass (§2.6): skip the card's gate checks with an "
++                  "audited reason (>= 8 chars). Recorded as a gate_bypassed event."),
+     ], help="Mark one or more tasks done"),
++    _cmd("verdict", [
++        _arg("action", choices=["file"], help="File a reviewer verdict"),
++        _arg("--task", required=True, help="Task id the verdict belongs to"),
++        _arg("--file", required=True, help="Path to the verdict JSON file (§4.2)"),
++    ], help="File a sha-bound reviewer verdict (counts toward escalation only when filed)"),
++    _cmd("set-spend-ceiling", [
++        _TASK_ID,
++        _arg("--tokens", type=int, metavar="N",
++             help="Per-ticket token ceiling override (omit to clear back to config)"),
++        _arg("--clear", action="store_true", help="Clear the per-ticket override"),
++    ], help="Set a task's per-ticket spend ceiling (tokens)"),
+     _cmd("edit", [
+         _TASK_ID,
+         _arg("--title", help="Replace the task title"),

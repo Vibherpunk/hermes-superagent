@@ -1,0 +1,114 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 06a641eb4c..5bb80ef342 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -3680,7 +3680,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+         confirmed_runtime_lock: bool = False, bind_declared_conversation: bool = False,
+         request_id: Optional[str] = None, history_from_session: bool = False, run_owner_scope=None,
+         session_history_delivery: str = "", turn_author: Optional[dict[str, Any]] = None,
+-        relay_metadata: Optional[dict[str, Any]] = None, notification_category: str = "result",
++        relay_metadata: Optional[dict[str, Any]] = None, notification_category: Optional[str] = None,
+         resume_unanswered_turn: bool = False, approval_notify_callback=None,
+         approval_session_key: Optional[str] = None, walked_from: Optional[str] = None) -> tuple:
+         """Create an agent and run one turn in a thread executor -> ``(result, usage)``.
+@@ -3712,6 +3712,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
+                 bind_declared_conversation=bind_declared_conversation, request_id=request_id, run_owner_scope=run_owner_scope,
+                 history_from_session=history_from_session, session_history_delivery=session_history_delivery,
+                 turn_author=turn_author, resume_unanswered_turn=resume_unanswered_turn, relay_metadata=relay_metadata,
++                # U2b (surfaces Rev 3): forward the wake category ONLY when
++                # explicitly supplied. The None sentinel distinguishes "not
++                # supplied" from a supplied "result": an unconditional
++                # forward would stamp the wake marker on every API turn
++                # and suppress all api_server candidacy. Callers that never
++                # set it (/v1/runs, Responses, session chat) are unchanged;
++                # run_internal_session_turn always passes it explicitly.
++                **({"notification_category": notification_category} if notification_category is not None else {}),
+                 approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key)
+         loop = asyncio.get_running_loop()
+         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
+diff --git a/gateway/platforms/api_server_openai_routes.py b/gateway/platforms/api_server_openai_routes.py
+index 05e2d7b648..dc95c88337 100644
+--- a/gateway/platforms/api_server_openai_routes.py
++++ b/gateway/platforms/api_server_openai_routes.py
+@@ -919,8 +919,13 @@ class OpenAICompatRoutesMixin:
+         run_kwargs.update(self._authority_chat_kwargs(request, provided_session_id))
+         # This is presentation only. The ordinary API-key/session authorization
+         # above still applies; it grants no internal ingress or control authority.
+-        if provided_session_id and body.get("hermes_notification_category") == "diagnostic":
+-            run_kwargs["notification_category"] = "diagnostic"
++        if provided_session_id and body.get("hermes_notification_category"):
++            # U2b (surfaces Rev 3): pass ANY category value through, not
++            # only "diagnostic" — a wake self-post marks itself with its
++            # real category ("result" included) so admission can exclude
++            # it from Super Agent candidacy. A client setting this field
++            # only excludes its own turn (self-suppression, no privilege).
++            run_kwargs["notification_category"] = str(body["hermes_notification_category"])
+         if stream:
+             _stream_q = ThreadSafeAsyncQueue()
+             # tool_call_ids with an emitted "running": a "completed" without one (internal/
+diff --git a/gateway/session_api_turn.py b/gateway/session_api_turn.py
+index 31b546cd06..604336d776 100644
+--- a/gateway/session_api_turn.py
++++ b/gateway/session_api_turn.py
+@@ -57,10 +57,11 @@ def check_api_turn(authority, ref, payload):
+         # 'browser_control' is accepted and ignored: admissions persisted while the removed
+         # browser-extension control existed may carry it and must still recover.
+         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
+-                         'relay_metadata', 'resume_unanswered'}
++                         'relay_metadata', 'resume_unanswered', 'wake_notification'}
+                 or data.get('resume_unanswered', True) is not True
+                 or not {'history', 'settings'} <= set(data)
+                 or not isinstance(data.get('relay_metadata', {}), dict)
++                or not isinstance(data.get('wake_notification', ''), str)
+                 or (data['history'] is not None and not isinstance(data['history'], list))
+                 or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))):
+             raise RuntimeStoreError('invalid_params')
+@@ -187,6 +188,12 @@ def admit_api_steps(adapter, **kwargs):
+         # The request's Relay metadata rides the admission to the turn it describes (main passed it
+         # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.
+         payload['api_turn_v1']['relay_metadata'] = kwargs['relay_metadata']
++    if kwargs.get('notification_category'):
++        # U2b (surfaces Rev 3): a wake's category rides the admission as
++        # the wake_notification marker, so the drain can withhold the
++        # Super Agent user-turn flag for it. check_api_turn's allowlist
++        # carries the key (validation at admit AND drain/replay).
++        payload['api_turn_v1']['wake_notification'] = str(kwargs['notification_category'])
+     request_id = kwargs.get('request_id') or kwargs.get('active_run_id') or uuid.uuid4().hex
+     if not isinstance(kwargs['user_message'], list):
+         return (yield from _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs))
+diff --git a/gateway/session_ingress.py b/gateway/session_ingress.py
+index 38d11d7edd..08ec26b2c4 100644
+--- a/gateway/session_ingress.py
++++ b/gateway/session_ingress.py
+@@ -296,6 +296,13 @@ async def execute_admission(authority, ref, row):
+                     event.text = '\n'.join(part['text'] for part in prepared['content'] if part.get('type') == 'text')
+                 event.allow_gateway_control = False
+                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
++                # U2 drain flag (surfaces Rev 3 §3/U2 edit 1): a real user
++                # turn that arrived through the authenticated API door —
++                # literally an api_turn_v1 admission carrying no wake
++                # marker (U2b). Wakes, notification self-posts and
++                # automation/native payloads never satisfy this condition.
++                if 'api_turn_v1' in row['payload'] and 'wake_notification' not in row['payload']['api_turn_v1']:
++                    event._sa_user_turn = True
+             response = await authority.runner._handle_message(event)
+             result = captured.get('terminal_result', captured.get('result'))
+             if result is None:
+diff --git a/gateway/wake.py b/gateway/wake.py
+index fb78998e91..a2448b45b9 100644
+--- a/gateway/wake.py
++++ b/gateway/wake.py
+@@ -268,8 +268,11 @@ async def _self_post_chat_completion(adapter: Any, *, text: str, session_id: str
+     headers = {"Authorization": f"Bearer {api_key}", "X-Hermes-Session-Id": session_id}
+     payload = {"model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
+                "messages": [{"role": "user", "content": text}], "stream": False}
+-    if notification_category == "diagnostic":
+-        payload["hermes_notification_category"] = "diagnostic"
++    # U2b (surfaces Rev 3): every wake self-post self-identifies, "result"
++    # included — the marker that lets Super Agent admission tell a wake
++    # apart from a user turn at the API door. Inert when superagent is
++    # off (no consumer acts on the field without it).
++    payload["hermes_notification_category"] = notification_category
+     last_err: Optional[BaseException] = None
+     attempts = 1 + len(_RETRY_DELAYS_SECONDS)
+     for attempt in range(attempts):

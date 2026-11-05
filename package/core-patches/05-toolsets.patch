@@ -1,0 +1,391 @@
+diff --git a/tools/delegate_tool_toolsets.py b/tools/delegate_tool_toolsets.py
+index 25ec633153..f23a2716c0 100644
+--- a/tools/delegate_tool_toolsets.py
++++ b/tools/delegate_tool_toolsets.py
+@@ -20,6 +20,41 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
+         "cronjob_manage",  # no scheduling more work in the parent's name
+     ]
+ )
++
++KANBAN_WORKER_BLOCKED_TOOLS = DELEGATE_BLOCKED_TOOLS | frozenset(
++    [
++        "annotate_preview",
++        "close_terminal",
++        "desktop_preview",
++        "desktop_project",
++        "drive_preview",
++        "focus_pane",
++        "gui_tour",
++        "manage_catalog",
++        "react_to_message",
++        "read_terminal",
++        "read_window_below",
++        "set_theme",
++        "setup_beat",
++        "show_tip",
++    ]
++)
++
++
++def kanban_worker_deny_toolsets() -> list[str]:
++    """Return the 8 deny toolsets that must be stripped from kanban workers (E-020)."""
++    return [
++        "catalog",
++        "clarify",
++        "cronjob",
++        "delegation",
++        "desktop_ui",
++        "memory",
++        "onboarding",
++        "project",
++    ]
++
++
+ DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+ 
+ def _is_mcp_toolset_name(name: str) -> bool:
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index c8b64c095c..24e296f975 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -22,8 +22,9 @@ from hermes_cli.config import cfg_get, load_config
+ from tools.kanban_tools_schemas import (
+     KANBAN_ATTACH_SCHEMA,
+     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
+-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
++    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HANDBACK_SCHEMA, KANBAN_HEARTBEAT_SCHEMA,
++    KANBAN_VERDICT_SCHEMA,
++    KANBAN_LINK_SCHEMA, KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
+ 
+ logger = logging.getLogger(__name__)
+@@ -133,6 +134,7 @@ _UNDECLARED_ARGS: dict[str, frozenset[str]] = {
+     "kanban_create": frozenset({"session_id", "project_id"}),
+     # ``title`` is the pre-schema alias of ``filename`` that ``_handle_attach_url`` still honours.
+     "kanban_attach_url": frozenset({"title"}),
++    "kanban_handback": frozenset({"ticket_id"}),
+ }
+ 
+ 
+@@ -761,6 +763,26 @@ def _handle_complete(args: dict, **kw) -> str:
+                 f"Your task is still in-flight and its scratch workspace was kept. Fix the "
+                 f"artifact path or storage error, then retry kanban_complete with the same "
+                 f"handoff.")
++        except kb.GateFailedError as gate_err:
++            # Worker-side contract (§2.4): exhausted=True is TERMINAL for this
++            # session — the run is closed; do not call complete/block again for
++            # this run.  exhausted=False is a fix-and-retry instruction: the
++            # message carries the failing check's output tail.
++            if gate_err.exhausted:
++                return tool_error(
++                    f"kanban_complete refused: gate checks exhausted the retry budget; "
++                    f"the run is closed and the card has been re-queued or blocked. "
++                    f"STOP: do not call kanban_complete or kanban_block again for this run. {gate_err}")
++            return tool_error(
++                f"kanban_complete refused: a gate check failed. Your task and run are "
++                f"unchanged. Fix the failing check output below in the workspace, then "
++                f"retry kanban_complete. {gate_err}")
++        except kb.GateEnvError as gate_env_err:
++            # Environment failure: terminal for the session (the worker cannot
++            # fix a missing interpreter or a vanished workspace); run closed.
++            return tool_error(
++                f"kanban_complete refused: gate environment failure; the run is closed. "
++                f"STOP: do not retry for this run. {gate_env_err}")
+         except kb.LiveClaimError as claim_err:
+             # Env-less caller (orchestrator, another session) on a card a dispatcher
+             # worker is executing: refusing here is what keeps that worker's run open.
+@@ -815,6 +837,13 @@ def _handle_block(args: dict, **kw) -> str:
+     reason = _redact(
+         _require_text(args, "reason", "reason is required — explain what input you need"))
+     kind = args.get("kind")
++    diagnosis = _redact_opt(args.get("diagnosis"))
++    next_step = _redact_opt(args.get("next_step"))
++    next_step_within_mandate = (
++        _parse_bool_arg(args, "next_step_within_mandate")
++        if args.get("next_step_within_mandate") is not None
++        else None
++    )
+     with _board(args.get("board")) as (kb, conn):
+         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
+                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
+@@ -834,7 +863,12 @@ def _handle_block(args: dict, **kw) -> str:
+                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
+                f"finished or cannot proceed for another reason, call kanban_complete instead — "
+                f"the completion judge will evaluate it.")
+-        ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
++        ok = kb.block_task(
++            conn, tid, reason=reason, kind=kind,
++            diagnosis=diagnosis, next_step=next_step,
++            next_step_within_mandate=next_step_within_mandate,
++            expected_run_id=_worker_run_id(tid),
++        )
+         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
+         landed_kind = kb.get_task(conn, tid).block_kind
+         extra: dict = {"block_kind": landed_kind}
+@@ -1113,6 +1147,28 @@ def _handle_create(args: dict, **kw) -> str:
+     model_override, provider_override = args.get("model"), args.get("provider")
+     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
+     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
++    # Deterministic assignment (DESIGN rev 4, §3.3): PRECOMPUTE the plan here,
++    # before create_task opens its creation txn (B-9); the hook only writes.
++    assignment_hook = None
++    # FIX-18: precompute errors surface like the CLI path — creation fails
++    # visibly.  No blanket swallow: an unexpected error here must not
++    # silently create an unpinned card.
++    from hermes_cli import kanban_assignment as _ka_tool
++    from hermes_cli import kanban_board_config as _kbcfg_tool
++
++    _t_cfg, _t_errs = _kbcfg_tool.load_board_config()
++    if _kbcfg_tool.feature_enabled(_t_cfg, _t_errs, "assignment"):
++        _t_plan = _ka_tool.resolve_assignment(
++            args.get("work_class"), board_config=_t_cfg,
++            explicit=_ka_tool.ExplicitOverrides(
++                model=model_override, provider=provider_override,
++                reasoning_effort=args.get("reasoning_effort"),
++            ),
++            assignee=str(assignee) if assignee else None,
++        )
++
++        def assignment_hook(_conn, _tid, _plan=_t_plan):
++            _ka_tool.apply_creation_assignment(_conn, _tid, _plan)
+     with _board(args.get("board")) as (kb, conn):
+         from gateway.session_context import get_session_env
+         from tools.async_delegation import _current_origin_session_id
+@@ -1143,10 +1199,17 @@ def _handle_create(args: dict, **kw) -> str:
+             idempotency_key=args.get("idempotency_key"),
+             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+             model_override=model_override, provider_override=provider_override,
++            reasoning_effort=args.get("reasoning_effort"),
+             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
+             completion_contract=args.get("completion_contract"),
++            gate_spec=args.get("gate_spec"),
++            work_class=args.get("work_class"),
++            assignment_hook=assignment_hook,
+             initial_status=str(args.get("initial_status") or "running"),
+             created_by=_persisted_identity(), session_id=session_id)
++        # FIX-4: the assignment consumer surfaces ONLY its own section's
++        # errors, on the task it just created, when the feature is enabled.
++        _kbcfg_tool.surface_if_exercised(conn, new_tid, _t_cfg, _t_errs, "assignment")
+         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
+         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
+@@ -1257,6 +1320,46 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
+         return False
+ 
+ 
++@_kanban_handler("kanban_verdict")
++def _handle_verdict(args: dict, **kw) -> str:
++    """File a sha-bound reviewer verdict (§4.2).  The tool builds the artifact
++    from its arguments and calls file_verdict; the reviewer is the session
++    profile — never a free-text argument."""
++    task_id = args.get("task_id") or os.environ.get("HERMES_KANBAN_TASK")
++    _check(task_id, "task_id is required")
++    commit_sha = str(args.get("commit_sha") or "").strip()
++    _check(commit_sha, "commit_sha is required")
++    verdict = str(args.get("verdict") or "").strip()
++    _check(verdict in ("pass", "fail"), "verdict must be 'pass' or 'fail'")
++    reviewer = _persisted_identity()
++    payload = {
++        "version": 1,
++        "task_id": str(task_id),
++        "commit_sha": commit_sha,
++        "verdict": verdict,
++        "reviewer": reviewer,
++        "builder_model": args.get("builder_model"),
++        "builder_provider": args.get("builder_provider"),
++        "filed_at": int(time.time()),
++        "summary": str(args.get("summary") or "")[:4000],
++    }
++    with _board(args.get("board")) as (kb, conn):
++        from hermes_cli import kanban_board_config as _kbcfg_vt
++        from hermes_cli import kanban_escalation as _ke_vt
++
++        _vt_cfg, _vt_errs = _kbcfg_vt.load_board_config()
++        result = _ke_vt.file_verdict(
++            conn, str(task_id), source_path_or_payload=payload, filed_by=reviewer,
++            board_config=_vt_cfg,
++            escalation_enabled=_kbcfg_vt.feature_enabled(_vt_cfg, _vt_errs, "escalation"),
++            threshold=int(_kbcfg_vt.section_config(_vt_cfg, "escalation").get("threshold", 2)),
++        )
++        # FIX-4: the escalation consumer surfaces ONLY its own section's errors.
++        _kbcfg_vt.surface_if_exercised(conn, str(task_id), _vt_cfg, _vt_errs, "escalation")
++    return _ok(**{k: v for k, v in result.items() if k != "escalation"},
++               escalation=(result.get("escalation") or {}).get("action"))
++
++
+ @_kanban_handler("kanban_unblock")
+ def _handle_unblock(args: dict, **kw) -> str:
+     """Transition a blocked task to ready, or todo while parents remain open."""
+@@ -1288,6 +1391,40 @@ def _handle_link(args: dict, **kw) -> str:
+                    **({"gated_by": parent_id} if gated else {}))
+ 
+ 
++@_kanban_handler("kanban_handback")
++def _handle_handback(args: dict, **kw) -> str:
++    """Hand back a received trigger/follow-up that is out of scope for this task (E-027)."""
++    _reject_delegated_child_mutation("kanban_handback")
++    if "ticket_id" in args and "task_id" not in args:
++        args["task_id"] = args["ticket_id"]
++    tid = _require_task_id(args)
++    _enforce_worker_task_ownership(tid)
++    trigger_id = _require_text(args, "trigger_id", "trigger_id is required")
++    reason = _require_text(args, "reason", "reason is required")
++    with _board(args.get("board")) as (kb, conn):
++        _existing_task(kb, conn, tid)
++        from hermes_cli.orchestrator import trigger_handback
++        res = trigger_handback(conn, ticket_id=tid, trigger_id=trigger_id, reason=reason)
++        if isinstance(res, dict) and not res.get("ok", True):
++            return tool_error(res.get("error", "handback failed"))
++        if isinstance(res, str) and "error" in res:
++            return tool_error(res)
++        fields = dict(res) if isinstance(res, dict) else {}
++        fields.setdefault("ticket_id", tid)
++        fields.setdefault("trigger_id", trigger_id)
++        return _ok(**fields)
++
++
++def kanban_handback(trigger_id: str, reason: str, task_id: Optional[str] = None, board: Optional[str] = None) -> str:
++    """Hand back a trigger out of scope for the calling task (programmatic interface)."""
++    args: dict[str, Any] = {"trigger_id": trigger_id, "reason": reason}
++    if task_id:
++        args["task_id"] = task_id
++    if board:
++        args["board"] = board
++    return _handle_handback(args)
++
++
+ # --- Registration (order preserved: it is the order tools appear in the schema) ---
+ 
+ # kanban_list / kanban_unblock route the board and are hidden from task workers.
+@@ -1300,12 +1437,14 @@ _TOOLS = (
+     ("kanban_schedule", KANBAN_SCHEDULE_SCHEMA, _handle_schedule, "⏰"),
+     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),
+     ("kanban_request_changes", KANBAN_REQUEST_CHANGES_SCHEMA, _handle_request_changes, "↩"),
++    ("kanban_handback", KANBAN_HANDBACK_SCHEMA, _handle_handback, "↩"),
+     ("kanban_heartbeat", KANBAN_HEARTBEAT_SCHEMA, _handle_heartbeat, "💓"),
+     ("kanban_comment", KANBAN_COMMENT_SCHEMA, _handle_comment, "💬"),
+     ("kanban_attach", KANBAN_ATTACH_SCHEMA, _handle_attach, "📎"),
+     ("kanban_attach_url", KANBAN_ATTACH_URL_SCHEMA, _handle_attach_url, "📎"),
+     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
+     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
++    ("kanban_verdict", KANBAN_VERDICT_SCHEMA, _handle_verdict, "⚖"),
+     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
+ 
+diff --git a/tools/kanban_tools_schemas.py b/tools/kanban_tools_schemas.py
+index 0e996e3957..69bd3c7f26 100644
+--- a/tools/kanban_tools_schemas.py
++++ b/tools/kanban_tools_schemas.py
+@@ -195,6 +195,18 @@ KANBAN_BLOCK_SCHEMA = _schema(
+                 "The others surface to a human. Omit only if none apply."
+             ),
+         },
++        "diagnosis": _prop(
++            "string",
++            "Optional root cause the worker established.",
++        ),
++        "next_step": _prop(
++            "string",
++            "Optional concrete next action the next run should take.",
++        ),
++        "next_step_within_mandate": _prop(
++            "boolean",
++            "Optional attestation that next_step is inside the card's mandate.",
++        ),
+     },
+     ["reason"],
+ )
+@@ -383,6 +395,31 @@ KANBAN_ATTACHMENTS_SCHEMA = _schema(
+     [],
+ )
+ 
++KANBAN_VERDICT_SCHEMA = _schema(
++    "kanban_verdict",
++    (
++        "File a sha-bound reviewer verdict on a task (§4.2). A 'fail' verdict "
++        "counts as a structured failure toward frontier escalation only when "
++        "it binds to the reviewed commit (PR receipt or workspace history) and "
++        "passes the state-anchored episode rule; a 'pass' never counts. "
++        "Reviewer identity is your own session profile — you cannot file for "
++        "another reviewer, and self-review never counts."
++    ),
++    {
++        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
++        "commit_sha": _prop("string", "Full 40-hex commit sha of the reviewed state (required)."),
++        "verdict": {
++            "type": "string",
++            "enum": ["pass", "fail"],
++            "description": "Your verdict on the reviewed state.",
++        },
++        "summary": _prop("string", "Review summary (<= 4000 chars)."),
++        "builder_model": _prop("string", "Optional corroboration: the builder's model, if known."),
++        "builder_provider": _prop("string", "Optional corroboration: the builder's provider, if known."),
++    },
++    ["task_id", "commit_sha", "verdict"],
++)
++
+ KANBAN_CREATE_SCHEMA = _schema(
+     "kanban_create",
+     (
+@@ -420,6 +457,27 @@ KANBAN_CREATE_SCHEMA = _schema(
+                 "Optional namespace for multi-project isolation. "
+                 "Defaults to HERMES_TENANT env if set."
+         )),
++        "gate_spec": _prop("object", (
++                "Optional enforced gate spec (DESIGN rev 4 §2.1): "
++                "{version: 1, checks: [{id, argv, timeout_seconds?}], "
++                "fingerprint_exclude?: [glob]}. The checks run at "
++                "kanban_complete; the card cannot complete until they pass. "
++                "argv form only — shell strings are rejected."
++        )),
++        "work_class": {
++            "type": "string",
++            "enum": ["financial", "production", "architecture", "coding",
++                     "mechanical", "repair", "personal", "general"],
++            "description": (
++                "Deterministic assignment class (§3): frontier classes "
++                "(financial/production/architecture) are pinned to a frontier "
++                "seat at creation; mechanical/repair to the cheap seat."
++            ),
++        },
++        "reasoning_effort": _prop("string", (
++                "Optional reasoning effort pin for the worker "
++                "(minimal|low|medium|high|xhigh|max|ultra|none)."
++        )),
+         "priority": _prop("integer", (
+                 "Dispatcher tiebreaker. Higher = picked sooner "
+                 "when multiple ready tasks share an assignee."
+@@ -549,3 +607,19 @@ KANBAN_LINK_SCHEMA = _schema(
+     },
+     ["parent_id", "child_id"],
+ )
++
++KANBAN_HANDBACK_SCHEMA = _schema(
++    "kanban_handback",
++    (
++        "Hand back a received trigger/follow-up that is out of scope or belongs "
++        "to another ticket. A ticket may hand back a given trigger at most once. "
++        "When no other ticket owns the trigger, it re-enters evaluation carrying the handback reason."
++    ),
++    {
++        "trigger_id": _prop("string", "Id of the trigger being handed back."),
++        "reason": _prop("string", "Why this trigger is out of scope or not owned by this ticket."),
++        "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
++    },
++    ["trigger_id", "reason"],
++)
++
+diff --git a/toolsets.py b/toolsets.py
+index a4f73e29c0..3c7640365a 100644
+--- a/toolsets.py
++++ b/toolsets.py
+@@ -25,7 +25,7 @@ _HERMES_CORE_TOOLS = [
+     "cronjob_manage",
+     "kanban_show", "kanban_list",
+     "kanban_complete", "kanban_block", "kanban_request_review",
+-    "kanban_request_changes",
++    "kanban_request_changes", "kanban_handback",
+     "kanban_heartbeat",
+     "kanban_comment", "kanban_create", "kanban_link",
+     "kanban_unblock",
